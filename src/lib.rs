@@ -17,12 +17,13 @@ struct InverseHarmony {
     c2r_plan: Arc<dyn ComplexToReal<f32>>,
     freq_buffer: Vec<f32>,
     sample_rate: f32,
+    r2c_input_buffer: Vec<f32>,
     r2c_output_buffer: Vec<Complex<f32>>,
     c2r_input_buffer: Vec<Complex<f32>>,
     freq_step: f32,
     scratch_complex_buffer: Vec<Complex<f32>>,
     c2r_len: usize,
-    gain_scale: f32,
+    c2r_output_buffer: Vec<f32>,
 }
 
 // TODO: A lot of the FFT parameters that would be really nice to have
@@ -50,6 +51,9 @@ struct InverseHarmonyParams {
     // Measured in ms
     #[id = "f0window"]
     pub f0window: IntParam,
+
+    #[id = "dry/wet"]
+    pub dry_wet: FloatParam,
 }
 
 impl Default for InverseHarmony {
@@ -60,11 +64,13 @@ impl Default for InverseHarmony {
         // Inverse FFT
         let c2r_plan = planner.plan_fft_inverse(FFT_WINDOW_SIZE);
         // Allocate buffers for convolution filter
+        let r2c_input_buffer = r2c_plan.make_input_vec();
         let r2c_output_buffer = r2c_plan.make_output_vec();
         let c2r_input_buffer = r2c_output_buffer.clone();
         let c2r_len = c2r_input_buffer.len();
         let freq_buffer = vec![0.0f32; r2c_output_buffer.len()];
         let scratch_complex_buffer = c2r_plan.make_scratch_vec();
+        let c2r_output_buffer = c2r_plan.make_output_vec();
 
         Self {
             params: Arc::new(InverseHarmonyParams::default()),
@@ -73,12 +79,13 @@ impl Default for InverseHarmony {
             c2r_plan,
             sample_rate: 44100.0,
             freq_buffer,
+            r2c_input_buffer,
             r2c_output_buffer,
             c2r_input_buffer,
             freq_step: 0.0,
             scratch_complex_buffer,
             c2r_len,
-            gain_scale: 0.0,
+            c2r_output_buffer,
         }
     }
 }
@@ -135,6 +142,8 @@ impl Default for InverseHarmonyParams {
                     max: 1000000,
                 },
             ),
+
+            dry_wet: FloatParam::new("Dry/Wet", 0.5, FloatRange::Linear { min: 0.0, max: 1.0 }),
         }
     }
 }
@@ -221,19 +230,27 @@ impl Plugin for InverseHarmony {
                 for val in &mut self.c2r_input_buffer {
                     *val = Complex::zero();
                 }
-                // Forward FFT, `real_fft_buffer` already is padded with zeros, and
-                // the padding from the last iteration will already have been added
-                // back to the start of the buffer
+
+                // Copy values into dedicated dry buffer, input buffer to r2c will be destroyed
+                for (i, val) in real_fft_buffer.iter().enumerate() {
+                    self.r2c_input_buffer[i] = *val;
+                }
+
                 // nih_log!("Input");
                 // nih_dbg!(&real_fft_buffer);
 
                 // Get max value of input buffer
-                self.gain_scale = 0.0;
+                let mut gain_scale = 0.0;
                 for el in &mut *real_fft_buffer {
-                    if *el > self.gain_scale {
-                        self.gain_scale = *el;
+                    let el_abs = el.abs();
+                    if el_abs > gain_scale {
+                        gain_scale = el_abs;
                     }
                 }
+
+                // Forward FFT, `real_fft_buffer` already is padded with zeros, and
+                // the padding from the last iteration will already have been added
+                // back to the start of the buffer
                 self.r2c_plan
                     .process_with_scratch(
                         real_fft_buffer,
@@ -257,8 +274,10 @@ impl Plugin for InverseHarmony {
                     return;
                 }
 
-                nih_log!("Complex pre-processing");
-                nih_dbg!(&self.r2c_output_buffer);
+                // nih_log!("Dry after FFT forward: {:#?}", &real_fft_buffer);
+
+                // nih_log!("Complex pre-processing");
+                // nih_dbg!(&self.r2c_output_buffer);
 
                 // Find its actual frequency value
                 let f0 = self.freq_buffer[max.1];
@@ -269,9 +288,9 @@ impl Plugin for InverseHarmony {
                 for (i, a) in self.freq_buffer.iter().enumerate() {
                     let mut inv = *a;
                     // Throw out the top and bottom bins to avoid weird artifacting
-                    if inv == 0.0 || inv == self.freq_buffer[self.freq_buffer.len() - 1] {
-                        continue;
-                    }
+                    // if inv == 0.0 || inv == self.freq_buffer[self.freq_buffer.len() - 1] {
+                    //     continue;
+                    // }
                     inv = f02 / inv;
                     // Binary search freq_buffer for inverse
                     // Need the bins at the returned index and one less
@@ -315,34 +334,46 @@ impl Plugin for InverseHarmony {
                 // get added to bin 0 resulting in huge gain. Easiest thing
                 // to do is discard bin 0 entirely.
                 // Need to set imaginary parts of first and last index to 0.
-                self.c2r_input_buffer[0] = Complex::zero();
+                self.c2r_input_buffer[0].im = 0.0;
                 self.c2r_input_buffer[self.c2r_len - 1].im = 0.0;
 
-                nih_log!("Before back");
-                nih_dbg!(&self.c2r_input_buffer);
+                // nih_log!("Before back");
+                // nih_dbg!(&self.c2r_input_buffer);
 
                 self.c2r_plan
                     .process_with_scratch(
                         &mut self.c2r_input_buffer,
-                        real_fft_buffer,
+                        &mut self.c2r_output_buffer,
                         &mut self.scratch_complex_buffer,
                     )
                     .unwrap();
 
-                let mut out_scale = 0.0f32;
-                for ele in &mut *real_fft_buffer {
-                    if *ele > out_scale {
-                        out_scale = *ele;
+                // Normalize gain to unity with input
+                let mut out_scale = 0.0;
+                for ele in &mut self.c2r_output_buffer {
+                    let ele_abs = ele.abs();
+                    if ele_abs > out_scale {
+                        out_scale = ele_abs;
                     }
                 }
 
-                let factor = self.gain_scale / out_scale;
-                for ele in &mut *real_fft_buffer {
+                let factor = gain_scale / out_scale;
+                for ele in &mut self.c2r_output_buffer {
                     *ele *= factor;
                 }
 
-                nih_log!("Output");
-                nih_dbg!(&real_fft_buffer);
+                // nih_log!("Dry_wet: {}", self.params.dry_wet.value());
+                // nih_log!("Before dry/wet WET: {:#?}", self.c2r_output_buffer);
+                // nih_log!("Before dry/wet DRY: {:#?}", &real_fft_buffer);
+                // Combine dry and wet
+                // TODO: getting some values way out of gain range here, why is that?
+                for (i, e) in self.r2c_input_buffer.iter().enumerate() {
+                    real_fft_buffer[i] = ((1.0 - self.params.dry_wet.value()) * *e)
+                        + (self.params.dry_wet.value() * self.c2r_output_buffer[i]);
+                }
+
+                // nih_log!("Output");
+                // nih_dbg!(&real_fft_buffer);
             });
         // for channel_samples in buffer.iter_samples() {
         //     // Smoothing is optionally built into the parameters themselves
