@@ -9,6 +9,7 @@ use std::sync::Arc;
 const WINDOW_SIZE: usize = 4096;
 const FILTER_SIZE: usize = WINDOW_SIZE / 2;
 const FFT_WINDOW_SIZE: usize = WINDOW_SIZE + FILTER_SIZE;
+const NUM_OVERLAPS: usize = 1;
 
 struct InverseHarmony {
     params: Arc<InverseHarmonyParams>,
@@ -211,7 +212,7 @@ impl Plugin for InverseHarmony {
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
         self.stft
-            .process_overlap_add(buffer, 1, |_channel_idx, real_fft_buffer| {
+            .process_overlap_add(buffer, NUM_OVERLAPS, |_channel_idx, real_fft_buffer| {
                 // Need to zero out the c2r input buffer every loop
                 self.c2r_input_buffer[..].fill(Complex::zero());
 
@@ -354,6 +355,7 @@ impl Plugin for InverseHarmony {
                     .unwrap();
 
                 // Normalize gain to unity with input
+                // Also going to compensate for number of overlaps here
                 let mut out_scale = 0.0;
                 for ele in &mut self.c2r_output_buffer {
                     let ele_abs = ele.abs();
@@ -364,10 +366,10 @@ impl Plugin for InverseHarmony {
 
                 let factor = gain_scale / out_scale;
                 for ele in &mut self.c2r_output_buffer {
-                    *ele *= factor;
+                    *ele *= factor / NUM_OVERLAPS as f32;
                 }
 
-                nih_log!("INVSTFT Post-normal: {:#?}", self.c2r_output_buffer);
+                // nih_log!("INVSTFT Post-normal: {:#?}", self.c2r_output_buffer);
 
                 // Apply hann filter here to get rid of time aliasing
                 for (out_val, fil_val) in self.c2r_output_buffer.iter_mut().zip(&self.filter) {
