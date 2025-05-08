@@ -24,6 +24,7 @@ struct InverseHarmony {
     scratch_complex_buffer: Vec<Complex<f32>>,
     c2r_len: usize,
     c2r_output_buffer: Vec<f32>,
+    filter: Vec<f32>,
 }
 
 // TODO: A lot of the FFT parameters that would be really nice to have
@@ -72,6 +73,20 @@ impl Default for InverseHarmony {
         let scratch_complex_buffer = c2r_plan.make_scratch_vec();
         let c2r_output_buffer = c2r_plan.make_output_vec();
 
+        // Build a super simple low-pass filter from one of the built in window functions
+        let filter = util::window::hann(FFT_WINDOW_SIZE);
+        // // And make sure to normalize this so convolution sums to 1
+        // let filter_normalization_factor = filter.iter().sum::<f32>().recip();
+        // for sample in &mut filter {
+        //     *sample *= filter_normalization_factor;
+        // }
+
+        // r2c_input_buffer[..FILTER_SIZE].copy_from_slice(&filter_window);
+
+        // r2c_plan
+        //     .process_with_scratch(&mut r2c_input_buffer, &mut r2c_output_buffer, &mut [])
+        //     .unwrap();
+
         Self {
             params: Arc::new(InverseHarmonyParams::default()),
             stft: util::StftHelper::new(2, WINDOW_SIZE, FILTER_SIZE),
@@ -80,12 +95,13 @@ impl Default for InverseHarmony {
             sample_rate: 44100.0,
             freq_buffer,
             r2c_input_buffer,
-            r2c_output_buffer,
+            r2c_output_buffer: r2c_output_buffer.clone(),
             c2r_input_buffer,
             freq_step: 0.0,
             scratch_complex_buffer,
             c2r_len,
             c2r_output_buffer,
+            filter,
         }
     }
 }
@@ -93,29 +109,6 @@ impl Default for InverseHarmony {
 impl Default for InverseHarmonyParams {
     fn default() -> Self {
         Self {
-            // This gain is stored as linear gain. NIH-plug comes with useful conversion functions
-            // to treat these kinds of parameters as if we were dealing with decibels. Storing this
-            // as decibels is easier to work with, but requires a conversion for every sample.
-            // gain: FloatParam::new(
-            //     "Gain",
-            //     util::db_to_gain(0.0),
-            //     FloatRange::Skewed {
-            //         min: util::db_to_gain(-30.0),
-            //         max: util::db_to_gain(30.0),
-            //         // This makes the range appear as if it was linear when displaying the values as
-            //         // decibels
-            //         factor: FloatRange::gain_skew_factor(-30.0, 30.0),
-            //     },
-            // )
-            // // Because the gain parameter is stored as linear gain instead of storing the value as
-            // // decibels, we need logarithmic smoothing
-            // .with_smoother(SmoothingStyle::Logarithmic(50.0))
-            // .with_unit(" dB")
-            // // There are many predefined formatters we can use here. If the gain was stored as
-            // // decibels instead of as a linear gain value, we could have also used the
-            // // `.with_step_size(0.1)` function to get internal rounding.
-            // .with_value_to_string(formatters::v2s_f32_gain_to_db(2))
-            // .with_string_to_value(formatters::s2v_f32_gain_to_db()),
             f0: FloatParam::new(
                 "f0",
                 440.0,
@@ -162,21 +155,12 @@ impl Plugin for InverseHarmony {
         AudioIOLayout {
             main_input_channels: NonZeroU32::new(2),
             main_output_channels: NonZeroU32::new(2),
-
-            aux_input_ports: &[],
-            aux_output_ports: &[],
-
-            // Individual ports and the layout as a whole can be named here. By default these names
-            // are generated as needed. This layout will be called 'Stereo', while a layout with
-            // only one input and output channel would be called 'Mono'.
-            names: PortNames::const_default(),
+            ..AudioIOLayout::const_default()
         },
         AudioIOLayout {
             main_input_channels: NonZeroU32::new(1),
             main_output_channels: NonZeroU32::new(1),
-            aux_input_ports: &[],
-            aux_output_ports: &[],
-            names: PortNames::const_default(),
+            ..AudioIOLayout::const_default()
         },
     ];
 
@@ -204,13 +188,15 @@ impl Plugin for InverseHarmony {
         buffer_config: &BufferConfig,
         context: &mut impl InitContext<Self>,
     ) -> bool {
-        context.set_latency_samples(self.stft.latency_samples());
+        context.set_latency_samples(self.stft.latency_samples() + (FILTER_SIZE as u32 / 2));
         self.sample_rate = buffer_config.sample_rate;
         // Frequencies go up to nyquist
         self.freq_step = (self.sample_rate / 2.0) / (self.freq_buffer.len() as f32);
         for i in 0..self.freq_buffer.len() {
             self.freq_buffer[i] = i as f32 * self.freq_step;
         }
+        self.stft.set_block_size(WINDOW_SIZE);
+
         true
     }
 
@@ -227,14 +213,13 @@ impl Plugin for InverseHarmony {
         self.stft
             .process_overlap_add(buffer, 1, |_channel_idx, real_fft_buffer| {
                 // Need to zero out the c2r input buffer every loop
-                for val in &mut self.c2r_input_buffer {
-                    *val = Complex::zero();
-                }
+                self.c2r_input_buffer[..].fill(Complex::zero());
 
                 // Copy values into dedicated dry buffer, input buffer to r2c will be destroyed
-                for (i, val) in real_fft_buffer.iter().enumerate() {
-                    self.r2c_input_buffer[i] = *val;
-                }
+                self.r2c_input_buffer[..].copy_from_slice(&real_fft_buffer);
+                // for (i, val) in real_fft_buffer.iter().enumerate() {
+                //     self.r2c_input_buffer[i] = *val;
+                // }
 
                 // nih_log!("Input");
                 // nih_dbg!(&real_fft_buffer);
@@ -280,18 +265,29 @@ impl Plugin for InverseHarmony {
                 // nih_dbg!(&self.r2c_output_buffer);
 
                 // Find its actual frequency value
-                let f0 = self.freq_buffer[max.1];
+                let f0 = match self.params.autof0.value() {
+                    true => self.freq_buffer[max.1],
+                    false => self.params.f0.value(),
+                };
                 let f02 = f0 * f0;
-                nih_log!("f0: {f0}");
+                // nih_log!("f0: {f0}");
 
                 // Invert frequency
                 for (i, a) in self.freq_buffer.iter().enumerate() {
+                    // Not going to deal with bins greater than highest key on a piano, leads to too much energy concentrated in lowest
+                    // bins
+                    // if *a > 4186.01 {
+                    //     break;
+                    // }
+
                     let mut inv = *a;
+
                     // Throw out the top and bottom bins to avoid weird artifacting
                     // if inv == 0.0 || inv == self.freq_buffer[self.freq_buffer.len() - 1] {
                     //     continue;
                     // }
                     inv = f02 / inv;
+
                     // Binary search freq_buffer for inverse
                     // Need the bins at the returned index and one less
                     let bin_index = match self
@@ -330,6 +326,15 @@ impl Plugin for InverseHarmony {
                         (1.0 - norm_del) * self.r2c_output_buffer[i];
                 }
 
+                // Windowing
+                // for (bin, filterval) in self
+                //     .c2r_input_buffer
+                //     .iter_mut()
+                //     .zip(&self.lp_filter_spectrum)
+                // {
+                //     *bin *= filterval;
+                // }
+
                 // All of the very small components of energy in higher bins
                 // get added to bin 0 resulting in huge gain. Easiest thing
                 // to do is discard bin 0 entirely.
@@ -362,6 +367,13 @@ impl Plugin for InverseHarmony {
                     *ele *= factor;
                 }
 
+                nih_log!("INVSTFT Post-normal: {:#?}", self.c2r_output_buffer);
+
+                // Apply hann filter here to get rid of time aliasing
+                for (out_val, fil_val) in self.c2r_output_buffer.iter_mut().zip(&self.filter) {
+                    *out_val *= fil_val;
+                }
+
                 // nih_log!("Dry_wet: {}", self.params.dry_wet.value());
                 // nih_log!("Before dry/wet WET: {:#?}", self.c2r_output_buffer);
                 // nih_log!("Before dry/wet DRY: {:#?}", &real_fft_buffer);
@@ -375,13 +387,6 @@ impl Plugin for InverseHarmony {
                 // nih_log!("Output");
                 // nih_dbg!(&real_fft_buffer);
             });
-        // for channel_samples in buffer.iter_samples() {
-        //     // Smoothing is optionally built into the parameters themselves
-
-        //     for sample in channel_samples {
-        //         *sample *= 0.1;
-        //     }
-        // }
 
         ProcessStatus::Normal
     }
