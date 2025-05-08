@@ -26,6 +26,8 @@ struct InverseHarmony {
     c2r_len: usize,
     c2r_output_buffer: Vec<f32>,
     filter: Vec<f32>,
+    time_counter: usize,
+    f0: f32,
 }
 
 // TODO: A lot of the FFT parameters that would be really nice to have
@@ -103,6 +105,8 @@ impl Default for InverseHarmony {
             c2r_len,
             c2r_output_buffer,
             filter,
+            time_counter: 0,
+            f0: 0.0,
         }
     }
 }
@@ -266,11 +270,27 @@ impl Plugin for InverseHarmony {
                 // nih_dbg!(&self.r2c_output_buffer);
 
                 // Find its actual frequency value
-                let f0 = match self.params.autof0.value() {
-                    true => self.freq_buffer[max.1],
+                // Takes into account all parameters
+                self.f0 = match self.params.autof0.value() {
+                    true => {
+                        if self.params.f0withfft.value() {
+                            self.freq_buffer[max.1]
+                        } else {
+                            self.time_counter += WINDOW_SIZE;
+                            if self.time_counter
+                                > self.params.f0window.value() as usize
+                                    * (self.sample_rate as usize / 1000)
+                            {
+                                self.time_counter = 0;
+                                self.freq_buffer[max.1]
+                            } else {
+                                self.f0
+                            }
+                        }
+                    }
                     false => self.params.f0.value(),
                 };
-                let f02 = f0 * f0;
+                let f02 = self.f0 * self.f0;
                 // nih_log!("f0: {f0}");
 
                 // Invert frequency
