@@ -119,7 +119,7 @@ impl Default for InverseHarmonyParams {
                 440.0,
                 FloatRange::Skewed {
                     min: 20.0,
-                    max: 20000.0,
+                    max: 4186.0,
                     factor: FloatRange::skew_factor(-1.0),
                 },
             ),
@@ -221,7 +221,7 @@ impl Plugin for InverseHarmony {
                 self.c2r_input_buffer[..].fill(Complex::zero());
 
                 // Copy values into dedicated dry buffer, input buffer to r2c will be destroyed
-                self.r2c_input_buffer[..].copy_from_slice(&real_fft_buffer);
+                self.r2c_input_buffer[..].copy_from_slice(real_fft_buffer);
                 // for (i, val) in real_fft_buffer.iter().enumerate() {
                 //     self.r2c_input_buffer[i] = *val;
                 // }
