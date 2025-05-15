@@ -7,8 +7,7 @@ use std::convert::From;
 use std::sync::Arc;
 
 const WINDOW_SIZE: usize = 4096;
-const FILTER_SIZE: usize = WINDOW_SIZE / 2;
-const FFT_WINDOW_SIZE: usize = WINDOW_SIZE + FILTER_SIZE;
+const FFT_WINDOW_SIZE: usize = 2 * WINDOW_SIZE;
 const NUM_OVERLAPS: usize = 1;
 
 struct InverseHarmony {
@@ -70,7 +69,9 @@ impl Default for InverseHarmony {
         // Allocate buffers for convolution filter
         let r2c_input_buffer = r2c_plan.make_input_vec();
         let r2c_output_buffer = r2c_plan.make_output_vec();
-        let c2r_input_buffer = r2c_output_buffer.clone();
+        nih_log!("FFT output vec len: {}", r2c_output_buffer.len());
+        let c2r_input_buffer = c2r_plan.make_input_vec();
+        nih_log!("IFFT Input vec len: {}", c2r_input_buffer.len());
         let c2r_len = c2r_input_buffer.len();
         let freq_buffer = vec![0.0f32; r2c_output_buffer.len()];
         let scratch_complex_buffer = c2r_plan.make_scratch_vec();
@@ -92,7 +93,7 @@ impl Default for InverseHarmony {
 
         Self {
             params: Arc::new(InverseHarmonyParams::default()),
-            stft: util::StftHelper::new(2, WINDOW_SIZE, FILTER_SIZE),
+            stft: util::StftHelper::new(2, WINDOW_SIZE, WINDOW_SIZE),
             r2c_plan,
             c2r_plan,
             sample_rate: 44100.0,
@@ -193,7 +194,7 @@ impl Plugin for InverseHarmony {
         buffer_config: &BufferConfig,
         context: &mut impl InitContext<Self>,
     ) -> bool {
-        context.set_latency_samples(self.stft.latency_samples() + (FILTER_SIZE as u32 / 2));
+        context.set_latency_samples(self.stft.latency_samples());
         self.sample_rate = buffer_config.sample_rate;
         // Frequencies go up to nyquist
         self.freq_step = (self.sample_rate / 2.0) / (self.freq_buffer.len() as f32);
@@ -252,7 +253,7 @@ impl Plugin for InverseHarmony {
                 // Getting our most present frequency
                 let mut max: (f32, usize) = (0.0, 0);
                 for (index, elem) in self.r2c_output_buffer.iter().enumerate() {
-                    let new = elem.re();
+                    let new = elem.abs();
                     if new > max.0 {
                         max = (new, index);
                     }
@@ -301,13 +302,11 @@ impl Plugin for InverseHarmony {
                     //     break;
                     // }
 
-                    let mut inv = *a;
-
                     // Throw out the top and bottom bins to avoid weird artifacting
                     // if inv == 0.0 || inv == self.freq_buffer[self.freq_buffer.len() - 1] {
                     //     continue;
                     // }
-                    inv = f02 / inv;
+                    let inv = f02 / *a;
 
                     // Binary search freq_buffer for inverse
                     // Need the bins at the returned index and one less
@@ -326,25 +325,14 @@ impl Plugin for InverseHarmony {
                     };
 
                     let delta = upper_bin_freq - inv;
-                    // Edge cases where we're dealing with uppermost or lowermost bin
+                    // Edge cases where we're dealing with uppermost bin
                     if delta < 0.0 {
                         self.c2r_input_buffer[bin_index - 1] += self.r2c_output_buffer[i];
                         continue;
                     }
 
-                    if bin_index == 0 {
-                        self.c2r_input_buffer[bin_index] += self.r2c_output_buffer[i];
-                        continue;
-                    }
-
-                    // Linear bin interpolation, get "closeness" of freq value
-                    // to adjacent bins
-
                     // Between 0 and 1
-                    let norm_del = delta / self.freq_step;
-                    self.c2r_input_buffer[bin_index] += norm_del * self.r2c_output_buffer[i];
-                    self.c2r_input_buffer[bin_index - 1] +=
-                        (1.0 - norm_del) * self.r2c_output_buffer[i];
+                    self.c2r_input_buffer[bin_index] += self.r2c_output_buffer[i];
                 }
 
                 // Windowing
@@ -400,7 +388,6 @@ impl Plugin for InverseHarmony {
                 // nih_log!("Before dry/wet WET: {:#?}", self.c2r_output_buffer);
                 // nih_log!("Before dry/wet DRY: {:#?}", &real_fft_buffer);
                 // Combine dry and wet
-                // TODO: getting some values way out of gain range here, why is that?
                 for (i, e) in self.r2c_input_buffer.iter().enumerate() {
                     real_fft_buffer[i] = ((1.0 - self.params.dry_wet.value()) * *e)
                         + (self.params.dry_wet.value() * self.c2r_output_buffer[i]);
